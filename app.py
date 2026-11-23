@@ -1,9 +1,10 @@
 import json
 import time
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import List, Literal
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -14,13 +15,20 @@ from pypdf import PdfReader
 # ==========================================
 st.set_page_config(page_title="AMC 8 AI Practice & Coach", layout="wide")
 
-# Load secrets safely
 if "OPENAI_API_KEY" not in st.secrets:
     st.error("Missing `OPENAI_API_KEY` in `.streamlit/secrets.toml`.")
     st.stop()
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 MODEL_NAME = st.secrets.get("OPENAI_MODEL", "gpt-4o")
+
+ALL_TOPICS = [
+    "Arithmetic & Proportional Reasoning",
+    "Elementary Algebra",
+    "Elementary Geometry",
+    "Number Theory",
+    "Counting, Probability & Statistics",
+]
 
 Topics = Literal[
     "Arithmetic & Proportional Reasoning",
@@ -68,8 +76,9 @@ class StudyRecommendation(BaseModel):
 def init_state():
     defaults = {
         "kb": {
-            "question_bank": [],  # Questions extracted from past PDFs (with AI solutions)
-            "attempt_history": [],  # History of completed practice tests
+            "question_bank": [],
+            "attempt_history": [],
+            "self_confidence": {t: 50 for t in ALL_TOPICS},
         },
         "current_exam": None,
         "user_answers": {},
@@ -85,8 +94,41 @@ def init_state():
 init_state()
 
 
+def compute_topic_metrics() -> pd.DataFrame:
+    rows = []
+    all_results = [
+        r for att in st.session_state.kb["attempt_history"] for r in att["results"]
+    ]
+    bank = st.session_state.kb["question_bank"]
+
+    for topic in ALL_TOPICS:
+        topic_attempts = [r for r in all_results if r["topic"] == topic]
+        attempted_count = len(topic_attempts)
+        correct_count = sum(1 for r in topic_attempts if r["is_correct"])
+        bank_count = sum(1 for q in bank if q["topic"] == topic)
+
+        if attempted_count > 0:
+            confidence = round((correct_count / attempted_count) * 100, 1)
+            source = "Based on Test Accuracy"
+        else:
+            confidence = st.session_state.kb["self_confidence"].get(topic, 50)
+            source = "Self-Rated Baseline"
+
+        rows.append(
+            {
+                "Topic": topic,
+                "Questions Attempted": attempted_count,
+                "Correct Answers": correct_count,
+                "Past PDF Questions": bank_count,
+                "Total Exposure": attempted_count + bank_count,
+                "Confidence (%)": confidence,
+                "Metric Source": source,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def get_weak_subtopics() -> List[str]:
-    """Identify subtopics with < 70% accuracy from past attempts."""
     stats = {}
     for attempt in st.session_state.kb["attempt_history"]:
         for q in attempt["results"]:
@@ -96,12 +138,11 @@ def get_weak_subtopics() -> List[str]:
             if q["is_correct"]:
                 stats[sub]["correct"] += 1
 
-    weak = [
+    return [
         sub
         for sub, data in stats.items()
         if data["total"] > 0 and (data["correct"] / data["total"]) < 0.70
     ]
-    return weak
 
 
 # ==========================================
@@ -142,7 +183,6 @@ def generate_ai_exam(focus_weak_areas: bool = True) -> AMC8Exam:
 
 
 def extract_and_solve_pdf(uploaded_file) -> List[dict]:
-    """Extracts text from an unsolved AMC 8 PDF, parses questions, and solves them via OpenAI."""
     reader = PdfReader(uploaded_file)
     full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
 
@@ -255,12 +295,9 @@ def submit_exam():
 # ==========================================
 st.title("🏆 AMC 8 AI Practice & Knowledge Base")
 
-# Sidebar: Knowledge Base Persistence (Save / Load JSON)
 with st.sidebar:
     st.header("💾 Knowledge Base Sync")
-    st.caption(
-        "Download your Knowledge Base to save past PDFs and test attempts across sessions."
-    )
+    st.caption("Download your Knowledge Base to save past PDFs and test attempts across sessions.")
 
     kb_json = json.dumps(st.session_state.kb, indent=2)
     st.download_button(
@@ -273,7 +310,9 @@ with st.sidebar:
     uploaded_kb = st.file_uploader("⬆️ Restore Knowledge Base (.json)", type=["json"])
     if uploaded_kb is not None:
         if st.button("Load Uploaded Knowledge Base"):
-            st.session_state.kb = json.load(uploaded_kb)
+            loaded = json.load(uploaded_kb)
+            loaded.setdefault("self_confidence", {t: 50 for t in ALL_TOPICS})
+            st.session_state.kb = loaded
             st.success("Knowledge Base restored!")
             st.rerun()
 
@@ -281,14 +320,91 @@ with st.sidebar:
     st.metric("Past PDF Questions in Bank", len(st.session_state.kb["question_bank"]))
     st.metric("Completed Practice Tests", len(st.session_state.kb["attempt_history"]))
 
-tab1, tab2, tab3, tab4 = st.tabs(
+tab_home, tab1, tab2, tab3, tab4 = st.tabs(
     [
+        "🏠 Home Dashboard",
         "📝 AMC 8 Practice Test",
         "📄 Import Past PDFs (No Solutions)",
         "🎯 Practice Imported PDFs",
         "📊 Knowledge Base & AI Coach",
     ]
 )
+
+# ------------------------------------------
+# TAB 0: HOME DASHBOARD
+# ------------------------------------------
+with tab_home:
+    st.subheader("Your AMC 8 Readiness Overview")
+    metrics_df = compute_topic_metrics()
+
+    total_attempted = int(metrics_df["Questions Attempted"].sum())
+    total_correct = int(metrics_df["Correct Answers"].sum())
+    overall_acc = round((total_correct / total_attempted * 100), 1) if total_attempted > 0 else 0.0
+    avg_conf = round(metrics_df["Confidence (%)"].mean(), 1)
+
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("Overall Confidence", f"{avg_conf}%")
+    kpi2.metric("Practice Accuracy", f"{overall_acc}%" if total_attempted > 0 else "No tests yet")
+    kpi3.metric("Questions Solved", total_attempted)
+    kpi4.metric("PDF Bank Size", len(st.session_state.kb["question_bank"]))
+
+    st.divider()
+
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+        st.markdown("#### 🥧 AMC 8 Topic Breakdown & Confidence Share")
+        fig_pie = px.pie(
+            metrics_df,
+            names="Topic",
+            values="Confidence (%)",
+            hole=0.4,
+            color_discrete_sequence=px.colors.qualitative.Set2,
+        )
+        fig_pie.update_traces(
+            textposition="inside",
+            textinfo="percent+label",
+            hovertemplate="<b>%{label}</b><br>Confidence Score: %{value}%<br>Share of Total Confidence: %{percent}<extra></extra>",
+        )
+        fig_pie.update_layout(showlegend=False, margin=dict(t=20, b=20, l=10, r=10))
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with chart_col2:
+        st.markdown("#### 📈 Confidence Level by Topic (0–100%)")
+        fig_bar = px.bar(
+            metrics_df.sort_values("Confidence (%)", ascending=True),
+            x="Confidence (%)",
+            y="Topic",
+            orientation="h",
+            text="Confidence (%)",
+            color="Confidence (%)",
+            color_continuous_scale=["#ef4444", "#f59e0b", "#10b981"],
+            range_x=[0, 105],
+        )
+        fig_bar.update_traces(texttemplate="%{text}%", textposition="outside")
+        fig_bar.update_layout(
+            coloraxis_showscale=False,
+            xaxis_title="Confidence Score (%)",
+            yaxis_title="",
+            margin=dict(t=20, b=20, l=10, r=10),
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    with st.expander("🎚️ Set Initial Self-Confidence (Used until you take tests in a topic)"):
+        st.caption(
+            "Once you answer practice questions in a topic, your confidence automatically updates to your real test accuracy."
+        )
+        slider_cols = st.columns(len(ALL_TOPICS))
+        for idx, topic in enumerate(ALL_TOPICS):
+            with slider_cols[idx]:
+                val = st.slider(
+                    topic.split(" & ")[0],
+                    min_value=10,
+                    max_value=100,
+                    value=int(st.session_state.kb["self_confidence"].get(topic, 50)),
+                    key=f"conf_slider_{idx}",
+                )
+                st.session_state.kb["self_confidence"][topic] = val
 
 # ------------------------------------------
 # TAB 1: OFFICIAL FORMAT PRACTICE TEST
@@ -313,7 +429,6 @@ with tab1:
                 st.rerun()
 
     if st.session_state.current_exam:
-        # Timer Logic (2400 seconds = 40 minutes)
         if not st.session_state.exam_submitted:
             elapsed = time.time() - st.session_state.start_time
             remaining = max(0, int(2400 - elapsed))
@@ -333,7 +448,7 @@ with tab1:
 
         st.divider()
 
-        # Render Questions
+        # Render Questions & Review Results
         for q in st.session_state.current_exam:
             q_num = q["question_number"]
             st.markdown(f"**Problem {q_num}** — *{q['topic']} ({q['subtopic']})*")
@@ -348,11 +463,15 @@ with tab1:
             }
 
             if not st.session_state.exam_submitted:
+                # Find previously selected index if present
+                saved_ans = st.session_state.user_answers.get(q_num, None)
+                default_idx = ["A", "B", "C", "D", "E"].index(saved_ans) if saved_ans in ["A", "B", "C", "D", "E"] else None
+
                 choice = st.radio(
                     f"Select answer for Problem {q_num}:",
                     options=["A", "B", "C", "D", "E"],
                     format_func=lambda x: options_map[x],
-                    index=None,
+                    index=default_idx,
                     key=f"q_radio_{q_num}",
                     label_visibility="collapsed",
                 )
@@ -361,18 +480,20 @@ with tab1:
             else:
                 user_ans = st.session_state.user_answers.get(q_num, "Unanswered")
                 correct_ans = q["correct_answer"]
+
+                # Display detailed answer review breakdown
                 if user_ans == correct_ans:
-                    st.success(f"✅ Your Answer: ({user_ans}) — Correct!")
+                    st.success(f"✅ **Your Answer:** ({user_ans}) — Correct!")
+                elif user_ans == "Unanswered":
+                    st.warning(f"⚠️ **Your Answer:** Unanswered | **Correct Answer:** ({correct_ans})")
                 else:
-                    st.error(
-                        f"❌ Your Answer: ({user_ans}) | Correct Answer: ({correct_ans})"
-                    )
+                    st.error(f"❌ **Your Answer:** ({user_ans}) | **Correct Answer:** ({correct_ans})")
+
                 with st.expander("View Step-by-Step Solution"):
                     st.markdown(q["step_by_step_solution"])
 
             st.divider()
 
-        # Submit & Download Controls
         if not st.session_state.exam_submitted:
             if st.button("✅ Submit Exam", type="primary"):
                 submit_exam()
@@ -383,7 +504,6 @@ with tab1:
                 f"### Final Score: {latest_attempt['score']} / {latest_attempt['total_questions']}"
             )
 
-            # Downloadable File of Questions, User Answers & Solutions
             export_payload = json.dumps(latest_attempt, indent=2)
             st.download_button(
                 label="📥 Download Test Questions, Your Answers & Solutions (.json)",
@@ -453,11 +573,9 @@ with tab4:
     if not attempts:
         st.info("Complete at least one practice test to unlock analytics and AI coaching.")
     else:
-        # Flatten all question results
         all_results = [r for att in attempts for r in att["results"]]
         df = pd.DataFrame(all_results)
 
-        # Topic breakdown
         topic_stats = (
             df.groupby("topic")
             .agg(
@@ -473,7 +591,6 @@ with tab4:
         st.write("### Accuracy by AMC 8 Topic")
         st.dataframe(topic_stats, use_container_width=True)
 
-        # Subtopic breakdown
         subtopic_stats = (
             df.groupby(["topic", "subtopic"])
             .agg(
