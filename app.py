@@ -184,7 +184,7 @@ def compute_topic_metrics() -> pd.DataFrame:
         topic_attempts = [r for r in all_results if r["topic"] == topic]
         attempted_count = len(topic_attempts)
         correct_count = sum(1 for r in topic_attempts if r["is_correct"])
-        bank_count = sum(1 for q in bank if q["topic"] == topic]
+        bank_count = sum(1 for q in bank if q["topic"] == topic)  # Fixed closing parenthesis here
 
         if attempted_count > 0:
             confidence = round((correct_count / attempted_count) * 100, 1)
