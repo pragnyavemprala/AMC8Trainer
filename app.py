@@ -1,3 +1,4 @@
+import base64
 import json
 import time
 from datetime import datetime
@@ -5,6 +6,7 @@ from typing import List, Literal
 
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -71,15 +73,47 @@ class StudyRecommendation(BaseModel):
 
 
 # ==========================================
-# 2. SESSION STATE & KNOWLEDGE BASE HELPERS
+# 2. SESSION STATE & GITHUB SYNC HELPERS
 # ==========================================
+def fetch_kb_from_github() -> Optional[dict]:
+    """Attempts to automatically load knowledge_base.json from GitHub on startup."""
+    if "GITHUB_TOKEN" not in st.secrets:
+        return None
+    
+    try:
+        token = st.secrets["GITHUB_TOKEN"]
+        owner = "pragnyavemprala"
+        repo = "AMC8Trainer"
+        path = "knowledge_base.json"
+        
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            file_data = resp.json()
+            decoded_bytes = base64.b64decode(file_data["content"])
+            return json.loads(decoded_bytes.decode("utf-8"))
+    except Exception:
+        pass
+    return None
+
 def init_state():
+    # Try fetching existing KB from GitHub first
+    github_kb = fetch_kb_from_github()
+    
+    default_kb = github_kb if github_kb else {
+        "question_bank": [],
+        "attempt_history": [],
+        "self_confidence": {t: 50 for t in ALL_TOPICS},
+        "total_attempts_counter": 0,
+    }
+
     defaults = {
-        "kb": {
-            "question_bank": [],
-            "attempt_history": [],
-            "self_confidence": {t: 50 for t in ALL_TOPICS},
-        },
+        "kb": default_kb,
         "current_exam": None,
         "user_answers": {},
         "start_time": None,
@@ -90,22 +124,67 @@ def init_state():
         if key not in st.session_state:
             st.session_state[key] = val
 
+    # Ensure all required keys exist
+    st.session_state.kb.setdefault("question_bank", [])
+    st.session_state.kb.setdefault("attempt_history", [])
+    st.session_state.kb.setdefault("self_confidence", {t: 50 for t in ALL_TOPICS})
+    st.session_state.kb.setdefault("total_attempts_counter", len(st.session_state.kb["attempt_history"]))
+
 
 init_state()
+
+
+def push_kb_to_github(json_content_str: str) -> bool:
+    """Commits and pushes the updated knowledge base JSON directly to GitHub."""
+    if "GITHUB_TOKEN" not in st.secrets:
+        st.warning("`GITHUB_TOKEN` missing in secrets. Cannot sync to GitHub automatically.")
+        return False
+
+    token = st.secrets["GITHUB_TOKEN"]
+    owner = "pragnyavemprala"
+    repo = "AMC8Trainer"
+    path = "knowledge_base.json"
+    branch = "main"
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    # 1. Get current file sha if it exists (required by GitHub API for updates)
+    get_resp = requests.get(url, headers=headers)
+    sha = None
+    if get_resp.status_code == 200:
+        sha = get_resp.json().get("sha")
+
+    # 2. Encode content to Base64
+    encoded_content = base64.b64encode(json_content_str.encode("utf-8")).decode("utf-8")
+
+    payload = {
+        "message": f"Auto-update Knowledge Base - Attempt #{st.session_state.kb['total_attempts_counter']}",
+        "content": encoded_content,
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    put_resp = requests.put(url, headers=headers, json=payload)
+    return put_resp.status_code in [200, 201]
 
 
 def compute_topic_metrics() -> pd.DataFrame:
     rows = []
     all_results = [
-        r for att in st.session_state.kb["attempt_history"] for r in att["results"]
+        r for att in st.session_state.kb.get("attempt_history", []) for r in att["results"]
     ]
-    bank = st.session_state.kb["question_bank"]
+    bank = st.session_state.kb.get("question_bank", [])
 
     for topic in ALL_TOPICS:
         topic_attempts = [r for r in all_results if r["topic"] == topic]
         attempted_count = len(topic_attempts)
         correct_count = sum(1 for r in topic_attempts if r["is_correct"])
-        bank_count = sum(1 for q in bank if q["topic"] == topic)
+        bank_count = sum(1 for q in bank if q["topic"] == topic]
 
         if attempted_count > 0:
             confidence = round((correct_count / attempted_count) * 100, 1)
@@ -130,7 +209,7 @@ def compute_topic_metrics() -> pd.DataFrame:
 
 def get_weak_subtopics() -> List[str]:
     stats = {}
-    for attempt in st.session_state.kb["attempt_history"]:
+    for attempt in st.session_state.kb.get("attempt_history", []):
         for q in attempt["results"]:
             sub = q["subtopic"]
             stats.setdefault(sub, {"correct": 0, "total": 0})
@@ -190,7 +269,7 @@ def extract_and_solve_pdf(uploaded_file) -> List[dict]:
     Below is raw text extracted from a past AMC 8 exam PDF (which does not contain solutions).
     1. Parse every multiple-choice math problem found in the text (up to 25 questions).
     2. Clean up any broken formatting and format math using LaTeX ($...$).
-    3. Solve each problem rigorously step-by-step and determine the exact correct option (A, B, C, D, or E).
+    3. Solve each problem rigorously step-by-step and determine the exact correct option letter (A, B, C, D, or E).
     4. Classify each problem's official AMC 8 topic, specific subtopic, and difficulty tier.
 
     RAW PDF TEXT:
@@ -219,7 +298,7 @@ def extract_and_solve_pdf(uploaded_file) -> List[dict]:
 
 def generate_coach_feedback() -> StudyRecommendation:
     history_summary = []
-    for attempt in st.session_state.kb["attempt_history"]:
+    for attempt in st.session_state.kb.get("attempt_history", []):
         for r in attempt["results"]:
             history_summary.append(
                 {
@@ -231,7 +310,7 @@ def generate_coach_feedback() -> StudyRecommendation:
             )
 
     prompt = f"""
-    Analyze this student's AMC 8 attempt history and their imported past-paper question bank size ({len(st.session_state.kb['question_bank'])} solved past questions available).
+    Analyze this student's AMC 8 attempt history and their imported past-paper question bank size ({len(st.session_state.kb.get('question_bank', []))} solved past questions available).
     Attempt Data: {json.dumps(history_summary)}
 
     Provide:
@@ -252,11 +331,15 @@ def generate_coach_feedback() -> StudyRecommendation:
 
 
 # ==========================================
-# 4. EXAM GRADING & SUBMISSION LOGIC
+# 4. EXAM GRADING & ATTEMPT INCREMENT LOGIC
 # ==========================================
 def submit_exam():
     if st.session_state.exam_submitted or not st.session_state.current_exam:
         return
+
+    # Increment attempt counter
+    st.session_state.kb["total_attempts_counter"] = st.session_state.kb.get("total_attempts_counter", 0) + 1
+    current_attempt_num = st.session_state.kb["total_attempts_counter"]
 
     elapsed_sec = int(time.time() - st.session_state.start_time)
     results = []
@@ -265,19 +348,41 @@ def submit_exam():
     for q in st.session_state.current_exam:
         q_num = q["question_number"]
         chosen = st.session_state.user_answers.get(q_num, None)
-        is_correct = chosen == q["correct_answer"]
+        
+        correct_ans = str(q["correct_answer"]).strip().upper()
+        if len(correct_ans) > 1 and correct_ans[0] in ["A", "B", "C", "D", "E"]:
+            correct_ans = correct_ans[0]
+
+        is_correct = False
+        if chosen and chosen.strip().upper() == correct_ans:
+            is_correct = True
+        else:
+            options_map = {
+                "A": str(q.get("option_a", "")).strip(),
+                "B": str(q.get("option_b", "")).strip(),
+                "C": str(q.get("option_c", "")).strip(),
+                "D": str(q.get("option_d", "")).strip(),
+                "E": str(q.get("option_e", "")).strip(),
+            }
+            chosen_text = options_map.get(str(chosen).strip().upper(), "")
+            correct_text = options_map.get(correct_ans, "")
+            if chosen_text and chosen_text == correct_text:
+                is_correct = True
+
         if is_correct:
             score += 1
 
         results.append(
             {
                 **q,
+                "correct_answer": correct_ans,
                 "user_answer": chosen if chosen else "Unanswered",
                 "is_correct": is_correct,
             }
         )
 
     attempt_record = {
+        "attempt_number": current_attempt_num,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": st.session_state.exam_source,
         "score": score,
@@ -296,29 +401,47 @@ def submit_exam():
 st.title("🏆 AMC 8 AI Practice & Knowledge Base")
 
 with st.sidebar:
-    st.header("💾 Knowledge Base Sync")
-    st.caption("Download your Knowledge Base to save past PDFs and test attempts across sessions.")
+    st.header("💾 Knowledge Base & GitHub Sync")
+    st.caption(f"Current Attempt Number: **#{st.session_state.kb.get('total_attempts_counter', 0) + 1}**")
 
     kb_json = json.dumps(st.session_state.kb, indent=2)
+    
+    # 1. Download Option
     st.download_button(
         label="⬇️ Download Knowledge Base (.json)",
         data=kb_json,
-        file_name=f"amc8_knowledge_base_{datetime.now().strftime('%Y%m%d')}.json",
+        file_name=f"amc8_knowledge_base_attempt_{st.session_state.kb.get('total_attempts_counter', 0)}.json",
         mime="application/json",
     )
 
+    # 2. GitHub Sync Option
+    if st.button("🚀 Push KB to GitHub Repository"):
+        with st.spinner("Committing to pragnyavemprala/AMC8Trainer..."):
+            success = push_kb_to_github(kb_json)
+            if success:
+                st.success("Successfully pushed to GitHub!")
+            else:
+                st.error("Failed to push. Check your GITHUB_TOKEN in secrets.")
+
+    st.divider()
+
+    # 3. Upload Option
     uploaded_kb = st.file_uploader("⬆️ Restore Knowledge Base (.json)", type=["json"])
     if uploaded_kb is not None:
         if st.button("Load Uploaded Knowledge Base"):
             loaded = json.load(uploaded_kb)
+            loaded.setdefault("question_bank", [])
+            loaded.setdefault("attempt_history", [])
             loaded.setdefault("self_confidence", {t: 50 for t in ALL_TOPICS})
+            # Preserve or restore attempt counter based on uploaded history length
+            loaded.setdefault("total_attempts_counter", len(loaded["attempt_history"]))
             st.session_state.kb = loaded
-            st.success("Knowledge Base restored!")
+            st.success(f"Knowledge Base restored! Next attempt will be #{st.session_state.kb['total_attempts_counter'] + 1}")
             st.rerun()
 
     st.divider()
-    st.metric("Past PDF Questions in Bank", len(st.session_state.kb["question_bank"]))
-    st.metric("Completed Practice Tests", len(st.session_state.kb["attempt_history"]))
+    st.metric("Total Attempts Recorded", len(st.session_state.kb.get("attempt_history", [])))
+    st.metric("Past PDF Questions in Bank", len(st.session_state.kb.get("question_bank", [])))
 
 tab_home, tab1, tab2, tab3, tab4 = st.tabs(
     [
@@ -346,7 +469,7 @@ with tab_home:
     kpi1.metric("Overall Confidence", f"{avg_conf}%")
     kpi2.metric("Practice Accuracy", f"{overall_acc}%" if total_attempted > 0 else "No tests yet")
     kpi3.metric("Questions Solved", total_attempted)
-    kpi4.metric("PDF Bank Size", len(st.session_state.kb["question_bank"]))
+    kpi4.metric("PDF Bank Size", len(st.session_state.kb.get("question_bank", [])))
 
     st.divider()
 
@@ -410,7 +533,7 @@ with tab_home:
 # TAB 1: OFFICIAL FORMAT PRACTICE TEST
 # ------------------------------------------
 with tab1:
-    st.subheader("Official Format: 25 Questions | 40 Minutes | No Calculator")
+    st.subheader(f"Official Format: 25 Questions | 40 Minutes | Attempt #{st.session_state.kb.get('total_attempts_counter', 0) + 1}")
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -448,7 +571,6 @@ with tab1:
 
         st.divider()
 
-        # Render Questions & Review Results
         for q in st.session_state.current_exam:
             q_num = q["question_number"]
             st.markdown(f"**Problem {q_num}** — *{q['topic']} ({q['subtopic']})*")
@@ -463,7 +585,6 @@ with tab1:
             }
 
             if not st.session_state.exam_submitted:
-                # Find previously selected index if present
                 saved_ans = st.session_state.user_answers.get(q_num, None)
                 default_idx = ["A", "B", "C", "D", "E"].index(saved_ans) if saved_ans in ["A", "B", "C", "D", "E"] else None
 
@@ -479,15 +600,28 @@ with tab1:
                     st.session_state.user_answers[q_num] = choice
             else:
                 user_ans = st.session_state.user_answers.get(q_num, "Unanswered")
-                correct_ans = q["correct_answer"]
+                correct_ans = str(q["correct_answer"]).strip().upper()
+                if len(correct_ans) > 1 and correct_ans[0] in ["A", "B", "C", "D", "E"]:
+                    correct_ans = correct_ans[0]
 
-                # Display detailed answer review breakdown
+                user_full_text = options_map.get(user_ans, "Unanswered")
+                correct_full_text = options_map.get(correct_ans, f"({correct_ans})")
+
+                is_correct = False
                 if user_ans == correct_ans:
-                    st.success(f"✅ **Your Answer:** ({user_ans}) — Correct!")
-                elif user_ans == "Unanswered":
-                    st.warning(f"⚠️ **Your Answer:** Unanswered | **Correct Answer:** ({correct_ans})")
+                    is_correct = True
                 else:
-                    st.error(f"❌ **Your Answer:** ({user_ans}) | **Correct Answer:** ({correct_ans})")
+                    user_val = str(options_map.get(user_ans, "")).strip()
+                    correct_val = str(options_map.get(correct_ans, "")).strip()
+                    if user_val and user_val == correct_val:
+                        is_correct = True
+
+                if is_correct:
+                    st.success(f"✅ **Your Answer:** {user_full_text} — Correct!")
+                elif user_ans == "Unanswered":
+                    st.warning(f"⚠️ **Your Answer:** Unanswered | **Correct Answer:** {correct_full_text}")
+                else:
+                    st.error(f"❌ **Your Answer:** {user_full_text} | **Correct Answer:** {correct_full_text}")
 
                 with st.expander("View Step-by-Step Solution"):
                     st.markdown(q["step_by_step_solution"])
@@ -501,14 +635,14 @@ with tab1:
         else:
             latest_attempt = st.session_state.kb["attempt_history"][-1]
             st.success(
-                f"### Final Score: {latest_attempt['score']} / {latest_attempt['total_questions']}"
+                f"### Final Score: {latest_attempt['score']} / {latest_attempt['total_questions']} (Attempt #{latest_attempt['attempt_number']})"
             )
 
             export_payload = json.dumps(latest_attempt, indent=2)
             st.download_button(
-                label="📥 Download Test Questions, Your Answers & Solutions (.json)",
+                label="📥 Download Test Attempt Report (.json)",
                 data=export_payload,
-                file_name=f"amc8_attempt_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                file_name=f"amc8_attempt_{latest_attempt['attempt_number']}_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
                 mime="application/json",
                 type="primary",
             )
@@ -569,7 +703,7 @@ with tab3:
 with tab4:
     st.subheader("Performance Analytics & Personalized Study Plan")
 
-    attempts = st.session_state.kb["attempt_history"]
+    attempts = st.session_state.kb.get("attempt_history", [])
     if not attempts:
         st.info("Complete at least one practice test to unlock analytics and AI coaching.")
     else:
