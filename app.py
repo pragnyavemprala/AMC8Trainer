@@ -176,7 +176,7 @@ def init_state():
 init_state()
 
 # ==========================================
-# 3. LOGIN & REGISTRATION GATE SCREEN
+# 3. RELIABLE LOGIN & REGISTRATION GATE SCREEN
 # ==========================================
 if not st.session_state["logged_in"]:
     st.title("🔒 AMC 8 Trainer Portal")
@@ -186,46 +186,42 @@ if not st.session_state["logged_in"]:
 
     if auth_mode == "Login to existing account":
         st.subheader("Login")
-        with st.form("login_form", clear_on_submit=False):
-            username = st.text_input("Username", autocomplete="username").strip()
-            password = st.text_input("Password", type="password", autocomplete="current-password")
-            submit_login = st.form_submit_button("Login", type="primary")
-            
-            if submit_login:
-                users_db = st.session_state.kb.get("users", {})
-                if username in users_db and users_db[username] == password:
-                    st.session_state["logged_in"] = True
-                    st.session_state["current_user"] = username
-                    st.success(f"Welcome back, {username}!")
-                    st.rerun()
-                else:
-                    st.error("Invalid username or password.")
+        login_user = st.text_input("Username", key="login_user").strip()
+        login_pass = st.text_input("Password", type="password", key="login_pass")
+        
+        if st.button("Login", type="primary"):
+            users_db = st.session_state.kb.get("users", {})
+            if login_user in users_db and users_db[login_user] == login_pass:
+                st.session_state["logged_in"] = True
+                st.session_state["current_user"] = login_user
+                st.success(f"Welcome back, {login_user}!")
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
     else:
         st.subheader("Create a New Account")
-        with st.form("signup_form", clear_on_submit=False):
-            new_username = st.text_input("Choose Username", autocomplete="username").strip()
-            new_password = st.text_input("Choose Password", type="password", autocomplete="new-password")
-            confirm_password = st.text_input("Confirm Password", type="password", autocomplete="new-password")
-            submit_signup = st.form_submit_button("Register Account", type="primary")
-            
-            if submit_signup:
-                if not new_username or not new_password:
-                    st.error("Username and password cannot be empty.")
-                elif new_password != confirm_password:
-                    st.error("Passwords do not match.")
+        new_user = st.text_input("Choose Username", key="signup_user").strip()
+        new_pass = st.text_input("Choose Password", type="password", key="signup_pass")
+        confirm_pass = st.text_input("Confirm Password", type="password", key="confirm_pass")
+        
+        if st.button("Register Account", type="primary"):
+            if not new_user or not new_pass:
+                st.error("Username and password cannot be empty.")
+            elif new_pass != confirm_pass:
+                st.error("Passwords do not match.")
+            else:
+                users_db = st.session_state.kb.setdefault("users", {})
+                if new_user in users_db:
+                    st.error("Username already exists. Please choose another or log in.")
                 else:
-                    users_db = st.session_state.kb.setdefault("users", {})
-                    if new_username in users_db:
-                        st.error("Username already exists. Please choose another or log in.")
-                    else:
-                        users_db[new_username] = new_password
-                        st.session_state["logged_in"] = True
-                        st.session_state["current_user"] = new_username
-                        
-                        push_kb_to_github(json.dumps(st.session_state.kb, indent=2))
-                        
-                        st.success(f"Account created successfully! Welcome, {new_username}!")
-                        st.rerun()
+                    users_db[new_user] = new_pass
+                    st.session_state["logged_in"] = True
+                    st.session_state["current_user"] = new_user
+                    
+                    push_kb_to_github(json.dumps(st.session_state.kb, indent=2))
+                    
+                    st.success(f"Account created successfully! Welcome, {new_user}!")
+                    st.rerun()
 
     st.stop()
 
