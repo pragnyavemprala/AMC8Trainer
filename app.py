@@ -186,9 +186,9 @@ if not st.session_state["logged_in"]:
 
     if auth_mode == "Login to existing account":
         st.subheader("Login")
-        with st.form("login_form"):
-            username = st.text_input("Username").strip()
-            password = st.text_input("Password", type="password")
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", autocomplete="username").strip()
+            password = st.text_input("Password", type="password", autocomplete="current-password")
             submit_login = st.form_submit_button("Login", type="primary")
             
             if submit_login:
@@ -202,10 +202,10 @@ if not st.session_state["logged_in"]:
                     st.error("Invalid username or password.")
     else:
         st.subheader("Create a New Account")
-        with st.form("signup_form"):
-            new_username = st.text_input("Choose Username").strip()
-            new_password = st.text_input("Choose Password", type="password")
-            confirm_password = st.text_input("Confirm Password", type="password")
+        with st.form("signup_form", clear_on_submit=False):
+            new_username = st.text_input("Choose Username", autocomplete="username").strip()
+            new_password = st.text_input("Choose Password", type="password", autocomplete="new-password")
+            confirm_password = st.text_input("Confirm Password", type="password", autocomplete="new-password")
             submit_signup = st.form_submit_button("Register Account", type="primary")
             
             if submit_signup:
