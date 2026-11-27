@@ -4,6 +4,8 @@ import time
 from datetime import datetime
 from typing import List, Literal, Optional
 
+import boto3
+from botocore.exceptions import ClientError
 import pandas as pd
 import plotly.express as px
 import requests
@@ -73,37 +75,62 @@ class StudyRecommendation(BaseModel):
 
 
 # ==========================================
-# 2. SESSION STATE & GITHUB AUTO-SYNC HELPERS
+# 2. DYNAMODB & GITHUB SYNC HELPERS
 # ==========================================
-def fetch_kb_from_github() -> Optional[dict]:
-    """Automatically loads knowledge_base.json from GitHub on startup."""
-    if "GITHUB_TOKEN" not in st.secrets:
+def get_dynamodb_table():
+    """Connects to Amazon DynamoDB using Streamlit secrets."""
+    try:
+        dynamodb = boto3.resource(
+            'dynamodb',
+            aws_access_key_id=st.secrets.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=st.secrets.get("AWS_SECRET_ACCESS_KEY"),
+            region_name=st.secrets.get("AWS_DEFAULT_REGION", "us-east-1")
+        )
+        table_name = st.secrets.get("DYNAMODB_TABLE", "amc8_users_progress")
+        return dynamodb.Table(table_name)
+    except Exception as e:
+        return None
+
+
+def load_user_data_from_dynamodb(username: str) -> Optional[dict]:
+    """Pulls credentials and AMC8 progress for a specific user from DynamoDB."""
+    table = get_dynamodb_table()
+    if not table:
         return None
     
     try:
-        token = st.secrets["GITHUB_TOKEN"]
-        owner = "pragnyavemprala"
-        repo = "AMC8Trainer"
-        path = "knowledge_base.json"
-        
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-        }
-        
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 200:
-            file_data = resp.json()
-            decoded_bytes = base64.b64decode(file_data["content"])
-            return json.loads(decoded_bytes.decode("utf-8"))
-    except Exception:
+        response = table.get_item(Key={"username": username})
+        if "Item" in response:
+            return response["Item"]
+    except ClientError:
         pass
     return None
 
 
+def save_user_data_to_dynamodb(username: str, password_hash: str, kb_data: dict):
+    """Saves or updates the user's credentials and entire AMC8 progress payload in DynamoDB."""
+    table = get_dynamodb_table()
+    if not table:
+        return False
+    
+    try:
+        table.put_item(
+            Item={
+                "username": username,
+                "password": password_hash,
+                "question_bank": kb_data.get("question_bank", []),
+                "attempt_history": kb_data.get("attempt_history", []),
+                "self_confidence": kb_data.get("self_confidence", {}),
+                "total_attempts_counter": kb_data.get("total_attempts_counter", 0)
+            }
+        )
+        return True
+    except ClientError:
+        return False
+
+
 def push_kb_to_github(json_content_str: str) -> bool:
-    """Commits and pushes the updated knowledge base JSON directly to GitHub."""
+    """Commits and pushes backup knowledge base JSON directly to GitHub."""
     if "GITHUB_TOKEN" not in st.secrets:
         return False
 
@@ -144,18 +171,13 @@ def init_state():
     if "current_user" not in st.session_state:
         st.session_state["current_user"] = ""
 
-    github_kb = fetch_kb_from_github()
-    
-    default_kb = github_kb if github_kb else {
-        "users": {"admin": st.secrets.get("APP_PASSWORD", "admin123")},
-        "question_bank": [],
-        "attempt_history": [],
-        "self_confidence": {t: 50 for t in ALL_TOPICS},
-        "total_attempts_counter": 0,
-    }
-
     defaults = {
-        "kb": default_kb,
+        "kb": {
+            "question_bank": [],
+            "attempt_history": [],
+            "self_confidence": {t: 50 for t in ALL_TOPICS},
+            "total_attempts_counter": 0,
+        },
         "current_exam": None,
         "user_answers": {},
         "start_time": None,
@@ -165,12 +187,6 @@ def init_state():
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
-
-    st.session_state.kb.setdefault("users", {"admin": st.secrets.get("APP_PASSWORD", "admin123")})
-    st.session_state.kb.setdefault("question_bank", [])
-    st.session_state.kb.setdefault("attempt_history", [])
-    st.session_state.kb.setdefault("self_confidence", {t: 50 for t in ALL_TOPICS})
-    st.session_state.kb.setdefault("total_attempts_counter", len(st.session_state.kb["attempt_history"]))
 
 
 init_state()
@@ -190,10 +206,18 @@ if not st.session_state["logged_in"]:
         login_pass = st.text_input("Password", type="password", key="login_pass")
         
         if st.button("Login", type="primary"):
-            users_db = st.session_state.kb.get("users", {})
-            if login_user in users_db and users_db[login_user] == login_pass:
+            user_record = load_user_data_from_dynamodb(login_user)
+            if user_record and user_record.get("password") == login_pass:
                 st.session_state["logged_in"] = True
                 st.session_state["current_user"] = login_user
+                
+                # Load user progress from DynamoDB into session state
+                st.session_state.kb = {
+                    "question_bank": user_record.get("question_bank", []),
+                    "attempt_history": user_record.get("attempt_history", []),
+                    "self_confidence": user_record.get("self_confidence", {t: 50 for t in ALL_TOPICS}),
+                    "total_attempts_counter": user_record.get("total_attempts_counter", len(user_record.get("attempt_history", [])))
+                }
                 st.success(f"Welcome back, {login_user}!")
                 st.rerun()
             else:
@@ -210,15 +234,23 @@ if not st.session_state["logged_in"]:
             elif new_pass != confirm_pass:
                 st.error("Passwords do not match.")
             else:
-                users_db = st.session_state.kb.setdefault("users", {})
-                if new_user in users_db:
+                existing_user = load_user_data_from_dynamodb(new_user)
+                if existing_user:
                     st.error("Username already exists. Please choose another or log in.")
                 else:
-                    users_db[new_user] = new_pass
+                    initial_kb = {
+                        "question_bank": [],
+                        "attempt_history": [],
+                        "self_confidence": {t: 50 for t in ALL_TOPICS},
+                        "total_attempts_counter": 0
+                    }
+                    save_user_data_to_dynamodb(new_user, new_pass, initial_kb)
+                    
                     st.session_state["logged_in"] = True
                     st.session_state["current_user"] = new_user
+                    st.session_state.kb = initial_kb
                     
-                    push_kb_to_github(json.dumps(st.session_state.kb, indent=2))
+                    push_kb_to_github(json.dumps(initial_kb, indent=2))
                     
                     st.success(f"Account created successfully! Welcome, {new_user}!")
                     st.rerun()
@@ -385,7 +417,7 @@ def generate_coach_feedback() -> StudyRecommendation:
 
 
 # ==========================================
-# 5. EXAM GRADING & AUTO-SYNC SUBMISSION
+# 5. EXAM GRADING & CLOUD SYNC SUBMISSION
 # ==========================================
 def submit_exam():
     if st.session_state.exam_submitted or not st.session_state.current_exam:
@@ -447,8 +479,13 @@ def submit_exam():
     st.session_state.kb["attempt_history"].append(attempt_record)
     st.session_state.exam_submitted = True
 
-    kb_str = json.dumps(st.session_state.kb, indent=2)
-    push_kb_to_github(kb_str)
+    # Save progress to DynamoDB and GitHub backup
+    current_user = st.session_state.get("current_user", "admin")
+    user_record = load_user_data_from_dynamodb(current_user)
+    current_password = user_record.get("password", "admin123") if user_record else "admin123"
+    
+    save_user_data_to_dynamodb(current_user, current_password, st.session_state.kb)
+    push_kb_to_github(json.dumps(st.session_state.kb, indent=2))
 
 
 # ==========================================
@@ -476,13 +513,15 @@ with st.sidebar:
         mime="application/json",
     )
 
-    if st.button("🚀 Force Sync KB to GitHub"):
-        with st.spinner("Syncing to GitHub..."):
-            success = push_kb_to_github(kb_json)
-            if success:
-                st.success("Synced successfully!")
-            else:
-                st.error("Sync failed. Check GITHUB_TOKEN.")
+    if st.button("🚀 Force Sync KB to Cloud"):
+        with st.spinner("Syncing to DynamoDB & GitHub..."):
+            current_user = st.session_state.get("current_user", "admin")
+            user_record = load_user_data_from_dynamodb(current_user)
+            curr_pass = user_record.get("password", "admin123") if user_record else "admin123"
+            
+            save_user_data_to_dynamodb(current_user, curr_pass, st.session_state.kb)
+            push_kb_to_github(kb_json)
+            st.success("Synced successfully to cloud database!")
 
     st.divider()
     st.metric("Total Attempts Recorded", len(st.session_state.kb.get("attempt_history", [])))
@@ -680,7 +719,7 @@ with tab1:
         else:
             latest_attempt = st.session_state.kb["attempt_history"][-1]
             st.success(
-                f"### Final Score: {latest_attempt['score']} / {latest_attempt['total_questions']} (Attempt #{latest_attempt['attempt_number']}) — Synced to GitHub ✅"
+                f"### Final Score: {latest_attempt['score']} / {latest_attempt['total_questions']} (Attempt #{latest_attempt['attempt_number']}) — Synced to Cloud ✅"
             )
 
             export_payload = json.dumps(latest_attempt, indent=2)
@@ -713,6 +752,11 @@ with tab2:
                 st.session_state.kb["question_bank"].extend(solved_qs)
                 st.success(f"Added {len(solved_qs)} solved questions from **{pdf.name}**!")
         
+        # Save updated KB with new questions to DynamoDB
+        current_user = st.session_state.get("current_user", "admin")
+        user_record = load_user_data_from_dynamodb(current_user)
+        curr_pass = user_record.get("password", "admin123") if user_record else "admin123"
+        save_user_data_to_dynamodb(current_user, curr_pass, st.session_state.kb)
         push_kb_to_github(json.dumps(st.session_state.kb, indent=2))
 
     if st.session_state.kb["question_bank"]:
